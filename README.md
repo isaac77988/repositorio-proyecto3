@@ -32,3 +32,76 @@ Sistema académico que permite registrar y evaluar el desempeño de un portafoli
 | Movimientos | Historial completo de operaciones. |
 
 ## Arquitectura
+
+```
+Proyecto-Finance/
+├── main.py                          # Punto de entrada
+├── requirements.txt                 # Dependencias
+├── .gitignore
+├── LICENSE
+├── README.md
+├── api/
+│   └── cliente_api.py               # yfinance + open.er-api
+├── models/
+│   └── accion.py                    # Entidad Accion
+├── services/
+│   ├── gestor_portafolio.py         # Persistencia y registro de operaciones
+│   └── auditoria_financiera.py      # Cálculos y formato
+├── ui/
+│   ├── componentes_graficos.py      # Paleta y estilos
+│   ├── notificaciones.py            # Toasts flotantes
+│   └── ventana_principal.py         # Interfaz Tkinter
+└── docs/
+    ├── capturas/
+    │   ├── resumen.png
+    │   └── uml.png
+    └── uml/
+        └── diagrama_clases.puml
+```
+
+## Requisitos
+
+- Python 3.10 o superior
+- Tkinter (incluido en la instalación estándar de Python en Windows y macOS)
+- Conexión a internet para cotizaciones y tasas de cambio
+
+## Instalación
+
+```bash
+git clone https://github.com/isaac77988/repositorio-proyecto3
+cd Proyecto-Finance
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+## Ejecución
+
+```bash
+python main.py
+```
+
+La aplicación abre en modo oscuro con once pestañas navegables. El archivo `datos_portafolio.json` se crea automáticamente la primera vez.
+
+## Uso rápido
+
+1. En la pestaña **Cuenta**, depositar efectivo en COP.
+2. En la pestaña **CDT**, abrir un certificado indicando monto, plazo y tasa E.A.
+3. En la pestaña **Bonos** o **TES**, adquirir títulos de renta fija.
+4. En la pestaña **Acciones**, seleccionar una empresa del catálogo, consultar el precio en vivo y comprar o vender indicando la comisión del bróker.
+5. En la pestaña **Dividendos**, registrar los dividendos recibidos por las acciones en posición.
+6. En la pestaña **Rendimiento**, revisar la rentabilidad acumulada y la rentabilidad E.A. por activo y del portafolio completo.
+7. En la pestaña **Simulación**, probar una inversión histórica en cualquier acción del catálogo.
+
+## Retenciones aplicadas
+
+| Concepto | Retención |
+|----------|-----------|
+| Dividendos de acciones | 4% |
+| Rendimientos financieros (CDT, bonos, TES) | 7% |
+
+## Diagrama de clases
+
+![Diagrama de clases](docs/capturas/uml.png)
+
+También disponible en formato PlantUML: [docs/uml/diagrama_clases.puml](docs/uml/diagrama_clases.puml).
