@@ -4,6 +4,7 @@ tooltips en gráficas, toasts, tema claro/oscuro y badges de tendencia.
 """
 import threading
 import tkinter as tk
+from bisect import bisect_left, bisect_right
 from datetime import date, datetime, timedelta
 from tkinter import messagebox, ttk
 
@@ -22,6 +23,7 @@ from services.auditoria_financiera import (
     moneda,
     num,
     pct,
+    rentabilidad_acumulada,
     rentabilidad_ea,
 )
 from services.gestor_portafolio import (
@@ -32,6 +34,7 @@ from services.gestor_portafolio import (
 )
 from ui.componentes_graficos import obtener_paleta
 from ui.notificaciones import Toast
+from ui.selector_fecha import SelectorFecha
 
 TABS = ["Resumen", "Cuenta", "CDT", "Bonos", "TES", "Acciones", "Dividendos", "Divisas", "Rendimiento", "Simulación", "Movimientos"]
 
@@ -79,6 +82,16 @@ class AppFinanciera(tk.Tk):
         self.api = ClienteAPI()
         self.gestor = GestorPortafolio()
         self.valores_mercado = {}
+        self._hover_cids = {}
+        # Posiciones de la pestaña Simulación: [{"simbolo", "cantidad", "monto", "h": HistoricoDesde}]
+        self.sim_posiciones = []
+        self._sim_sel = None
+        # Fecha elegida en Simulación (por defecto, hace un año); sobrevive al cambio de tema.
+        hoy = date.today()
+        try:
+            self._fecha_sim = hoy.replace(year=hoy.year - 1)
+        except ValueError:  # 29 de febrero
+            self._fecha_sim = hoy.replace(year=hoy.year - 1, day=28)
         self.botones_nav = {}
         self.pestana_actual = None
         self.tema = "oscura"
@@ -299,11 +312,20 @@ class AppFinanciera(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _agregar_hover(self, canvas, ax, fechas, valores, formato_valor=None):
-        """Agrega crosshair vertical y tooltip con fecha y valor al pasar el mouse."""
+    def _agregar_hover(self, canvas, ax, fechas, valores, formato_valor=None, extra=None):
+        """
+        Agrega crosshair vertical y tooltip con fecha y valor al pasar el mouse.
+        `extra` es una lista opcional (un texto por punto) que se agrega al tooltip.
+        """
         p = self.paleta
         if not fechas or not valores:
             return
+
+        if not hasattr(self, "_hover_cids"):
+            self._hover_cids = {}
+        previo = self._hover_cids.pop(id(canvas), None)
+        if previo is not None:
+            canvas.mpl_disconnect(previo)
 
         xnums = [mdates.date2num(f) if not isinstance(f, (int, float)) else f for f in fechas]
 
@@ -328,18 +350,20 @@ class AppFinanciera(tk.Tk):
                     vline.set_visible(False)
                     canvas.draw_idle()
                 return
-            # Buscar el índice más cercano al cursor en X
             idx = min(range(len(xnums)), key=lambda i: abs(xnums[i] - event.xdata))
             y = valores[idx]
             annot.xy = (xnums[idx], y)
             fecha_txt = fechas[idx].strftime("%d/%m/%Y") if hasattr(fechas[idx], "strftime") else str(fechas[idx])
-            annot.set_text(f"{fecha_txt}\n{fmt(y)}")
+            texto = f"{fecha_txt}\n{fmt(y)}"
+            if extra:
+                texto += f"\n{extra[idx]}"
+            annot.set_text(texto)
             annot.set_visible(True)
             vline.set_xdata([xnums[idx], xnums[idx]])
             vline.set_visible(True)
             canvas.draw_idle()
 
-        canvas.mpl_connect("motion_notify_event", on_move)
+        self._hover_cids[id(canvas)] = canvas.mpl_connect("motion_notify_event", on_move)
 
     # 1. Resumen
 
@@ -398,7 +422,6 @@ class AppFinanciera(tk.Tk):
             )
             ax.set_title("Composición del Portafolio en COP", color=p["TEXTO_PRINCIPAL"], fontweight="bold", fontsize=11)
 
-            # Hover sobre las porciones
             etiquetas = [x[0] for x in partes]
             valores = [x[1] for x in partes]
             annot = ax.annotate(
@@ -880,7 +903,6 @@ class AppFinanciera(tk.Tk):
             for spine in ax.spines.values():
                 spine.set_color(p["BORDE_SUTIL"])
 
-            # Hover sobre las barras
             annot = ax.annotate(
                 "", xy=(0, 0), xytext=(8, 8), textcoords="offset points",
                 bbox=dict(boxstyle="round,pad=0.4", fc=p["BG_CARD"], ec=p["ACCESO_AZUL"], lw=1),
@@ -1022,77 +1044,343 @@ class AppFinanciera(tk.Tk):
 
     # 10. Simulación
 
+    MAX_POSICIONES_SIM = 12
+
     def _ui_simulacion(self):
         p = self.paleta
         tab = self.tabs["Simulación"]
-        f = ttk.LabelFrame(tab, text="Simulador Histórico de Inversión en Acciones")
-        f.pack(fill="x", padx=5, pady=8)
+        f = ttk.LabelFrame(tab, text="Simulador Histórico: agregue acciones indicando la cantidad y su fecha de compra")
+        f.pack(fill="x", padx=5, pady=(8, 4))
         ttk.Label(f, text="Empresa:").grid(row=0, column=0, padx=8, pady=8)
-        self.cb_sim = self._combo_acciones(f, "Apple (AAPL)", 28)
+        self.cb_sim = self._combo_acciones(f, "Apple (AAPL)", 24)
         self.cb_sim.grid(row=0, column=1)
-        ttk.Label(f, text="Monto (COP):").grid(row=0, column=2, padx=8)
-        self.e_sim_monto = ttk.Entry(f, width=14)
-        self.e_sim_monto.insert(0, "5000000")
-        self.e_sim_monto.grid(row=0, column=3)
-        ttk.Label(f, text="Periodo:").grid(row=0, column=4, padx=8)
-        self.c_sim_periodo = ttk.Combobox(f, values=list(self.PERIODOS), width=9, state="readonly")
-        self.c_sim_periodo.set("1 año")
-        self.c_sim_periodo.grid(row=0, column=5)
-        self._boton(f, "Simular", self.simular, "Accent").grid(row=0, column=6, padx=12)
+        ttk.Label(f, text="Fecha de compra:").grid(row=0, column=2, padx=(14, 8))
+        self.sel_fecha_sim = SelectorFecha(
+            f, p, inicial=self._fecha_sim,
+            on_change=lambda d: setattr(self, "_fecha_sim", d),
+        )
+        self.sel_fecha_sim.grid(row=0, column=3)
+        ttk.Label(f, text="Cantidad de acciones:").grid(row=0, column=4, padx=(14, 8))
+        self.e_sim_cantidad = ttk.Entry(f, width=10)
+        self.e_sim_cantidad.insert(0, "10")
+        self.e_sim_cantidad.grid(row=0, column=5, padx=(0, 8))
 
-        self.lbl_sim = ttk.Label(tab, text="", font=("Segoe UI", 10, "bold"), justify="left")
-        self.lbl_sim.pack(anchor="w", padx=10, pady=4)
-        self.fig_sim, self.canvas_sim = self._grafica(tab, (6, 3.2))
+        btns = tk.Frame(f, bg=p["BG_APP"])
+        btns.grid(row=1, column=0, columnspan=6, sticky="w", padx=8, pady=(0, 8))
+        self._boton(btns, "Agregar a la gráfica", self.agregar_simulacion, "Accent").pack(side="left", padx=(0, 6))
+        self._boton(btns, "Quitar seleccionada", self.quitar_simulacion, "Warn").pack(side="left", padx=6)
+        self._boton(btns, "Limpiar todo", self.limpiar_simulacion, "Danger").pack(side="left", padx=6)
 
-    def simular(self):
+        medio = tk.Frame(tab, bg=p["BG_APP"])
+        medio.pack(fill="x", padx=5, pady=2)
+        medio.columnconfigure(0, weight=1)
+        izq = tk.Frame(medio, bg=p["BG_APP"])
+        izq.grid(row=0, column=0, sticky="nsew")
+        cols = ("empresa", "cantidad", "fecha", "invertido", "hoy", "rend", "rend_ea")
+        self.tree_sim = self._tabla(
+            izq, cols,
+            ["Empresa", "Cant.", "Compra", "Invertido", "Valor hoy", "Rent.", "Rent. E.A."],
+            [155, 60, 85, 110, 115, 70, 75], altura=5, expandir=False,
+        )
+        self.tree_sim.bind("<<TreeviewSelect>>", self._seleccionar_sim)
+
+        der = tk.Frame(medio, bg=p["BG_APP"])
+        der.grid(row=0, column=1, sticky="n", padx=(8, 0), pady=6)
+        self.tarjetas_sim = {}
+        for clave in ("base", "hoy"):
+            marco = tk.Frame(der, bg=p["BG_CARD"], padx=12, pady=6,
+                             highlightbackground=p["BORDE_SUTIL"], highlightthickness=1)
+            marco.pack(fill="x", pady=(0, 4))
+            titulo = tk.Label(marco, text="ESE DÍA" if clave == "base" else "ÚLTIMO CIERRE",
+                              bg=p["BG_CARD"], fg=p["TEXTO_MUTED"], font=("Segoe UI", 8, "bold"))
+            titulo.pack(anchor="w")
+            lineas = {}
+            for k, etq in (("accion", "Acción"), ("dolar", "Dólar (COP)"), ("cop", "Acción en COP")):
+                r = tk.Frame(marco, bg=p["BG_CARD"])
+                r.pack(fill="x")
+                tk.Label(r, text=etq, width=13, anchor="w", bg=p["BG_CARD"],
+                         fg=p["TEXTO_MUTED"], font=("Segoe UI", 9)).pack(side="left")
+                v = tk.Label(r, text="—", anchor="w", bg=p["BG_CARD"],
+                             fg=p["TEXTO_PRINCIPAL"], font=("Segoe UI", 10, "bold"))
+                v.pack(side="left")
+                lineas[k] = v
+            self.tarjetas_sim[clave] = (titulo, lineas)
+
+        self.lbl_sim = ttk.Label(tab, text="", font=("Segoe UI", 10, "bold"), justify="left", wraplength=880)
+        self.lbl_sim.pack(anchor="w", padx=10, pady=(4, 0))
+        self.lbl_sim_nota = ttk.Label(tab, text="", foreground=p["TEXTO_MUTED"],
+                                      font=("Segoe UI", 9), justify="left", wraplength=880)
+        self.lbl_sim_nota.pack(anchor="w", padx=10, pady=(0, 2))
+        self.fig_sim, self.canvas_sim = self._grafica(tab, (6, 3.6))
+
+        self._refrescar_simulacion()
+
+    def agregar_simulacion(self):
         simbolo = extraer_simbolo(self.cb_sim.get())
+        if not simbolo:
+            return self.toast("Seleccione una empresa.", "error")
         try:
-            monto = leer_numero(self.e_sim_monto.get(), "Monto")
+            cantidad = leer_numero(self.e_sim_cantidad.get(), "Cantidad de acciones")
         except ValueError as e:
             return self.toast(str(e), "error")
-        periodo = self.PERIODOS[self.c_sim_periodo.get()]
+        fecha = self.sel_fecha_sim.get()
+        if fecha > date.today():
+            return self.toast("La fecha no puede ser futura.", "error")
+        if len(self.sim_posiciones) >= self.MAX_POSICIONES_SIM:
+            return self.toast(f"Máximo {self.MAX_POSICIONES_SIM} acciones en la gráfica.", "info")
 
         def tarea():
-            return self.api.consultar_accion(simbolo, periodo)
+            return self.api.consultar_desde(simbolo, fecha)
 
-        def callback(cot):
-            p = self.paleta
-            if not cot.serie_cop or len(cot.serie_cop) < 2:
-                return self.toast("Serie insuficiente para simular.", "error")
-            fechas = [f for f, _ in cot.serie_cop]
-            xnums = [mdates.date2num(f) for f in fechas]
-            precios = [v for _, v in cot.serie_cop]
-            acciones = monto / precios[0]
-            valores = [acciones * x for x in precios]
-            final = valores[-1]
-            ganancia = final - monto
-            rend = ganancia / monto * 100
-
-            self.lbl_sim.config(
-                foreground=p["VERDE_EXITO"] if ganancia >= 0 else p["ROJO_ALERTA"],
-                text=f"Si hubiera invertido {moneda(monto)} en {nombre_accion(simbolo)} ({self.c_sim_periodo.get()}):\n"
-                     f"Valor Hoy: {moneda(final)} | Ganancia: {moneda(ganancia)} ({pct(rend)})",
-            )
-
-            self.fig_sim.clear()
-            ax = self.fig_sim.add_subplot(111)
-            ax.set_facecolor(p["BG_CARD"])
-            ax.plot(xnums, valores, color=p["ACCESO_AZUL"], linewidth=2.4)
-            ax.fill_between(xnums, valores, min(valores) * 0.95, color=p["ACCESO_AZUL"], alpha=0.15)
-            ax.axhline(monto, color=p["TEXTO_MUTED"], linestyle=":", label="Monto Inicial")
-            ax.set_title("Evolución de la Simulación Histórica en COP", color=p["TEXTO_PRINCIPAL"], fontweight="bold", fontsize=11)
-            eje_cop(ax)
-            ax.grid(alpha=0.15, color=p["TEXTO_MUTED"], linestyle="--")
-            ax.tick_params(colors=p["TEXTO_MUTED"], labelsize=8)
-            for spine in ax.spines.values():
-                spine.set_color(p["BORDE_SUTIL"])
-            ax.xaxis_date()
-            self.fig_sim.autofmt_xdate()
-            self._agregar_hover(self.canvas_sim, ax, fechas, valores)
-            self.canvas_sim.draw()
-            self.toast("Simulación calculada", "exito")
+        def callback(h):
+            monto_inicial = cantidad * h.precio_base_cop
+            self.sim_posiciones.append({
+                "simbolo": simbolo,
+                "cantidad": cantidad,
+                "monto": monto_inicial,
+                "h": h,
+            })
+            self._sim_sel = len(self.sim_posiciones) - 1
+            self._refrescar_simulacion()
+            self.toast(f"{nombre_accion(simbolo)} ({cantidad_txt(cantidad)} un.) agregada", "exito")
 
         self._ejecutar_en_hilo(tarea, callback)
+
+    def quitar_simulacion(self):
+        sel = self.tree_sim.selection()
+        if not sel or sel[0] == "total":
+            return self.toast("Seleccione una acción de la tabla.", "info")
+        self.sim_posiciones.pop(int(sel[0]))
+        self._sim_sel = len(self.sim_posiciones) - 1 if self.sim_posiciones else None
+        self._refrescar_simulacion()
+
+    def limpiar_simulacion(self):
+        if not self.sim_posiciones:
+            return self.toast("No hay acciones para limpiar.", "info")
+        self.sim_posiciones.clear()
+        self._sim_sel = None
+        self._refrescar_simulacion()
+
+    def _seleccionar_sim(self, _e=None):
+        sel = self.tree_sim.selection()
+        if sel and sel[0] != "total":
+            self._sim_sel = int(sel[0])
+            self._mostrar_tarjetas_sim()
+
+    @staticmethod
+    def _precio_orig_txt(valor, mon):
+        """Precio en la moneda de listado de la acción."""
+        return f"US$ {num(valor)}" if mon == "USD" else f"{num(valor)} {mon}"
+
+    def _mostrar_tarjetas_sim(self):
+        """Precio de la acción y valor del dólar, ese día y en el último cierre."""
+        pos = self.sim_posiciones
+        i = self._sim_sel
+        if i is None or not (0 <= i < len(pos)):
+            for titulo, lineas in self.tarjetas_sim.values():
+                for v in lineas.values():
+                    v.config(text="—")
+            self.tarjetas_sim["base"][0].config(text="ESE DÍA")
+            self.tarjetas_sim["hoy"][0].config(text="ÚLTIMO CIERRE")
+            return
+        s = pos[i]
+        h = s["h"]
+        es_cop = h.moneda_original == "COP"
+        for clave, dt, orig, fx, cop in (
+            ("base", h.fecha_base, h.precio_base_original, h.fx_base, h.precio_base_cop),
+            ("hoy", h.fecha_actual, h.precio_actual_original, h.fx_actual, h.precio_actual_cop),
+        ):
+            titulo, lineas = self.tarjetas_sim[clave]
+            etiqueta = "ESE DÍA" if clave == "base" else "ÚLTIMO CIERRE"
+            titulo.config(text=f"{s['simbolo']} · {etiqueta} · {dt:%d/%m/%Y}")
+            lineas["accion"].config(text=self._precio_orig_txt(orig, h.moneda_original))
+            lineas["dolar"].config(text="—" if es_cop else moneda(fx))
+            lineas["cop"].config(text=moneda(cop))
+
+    def _refrescar_simulacion(self):
+        """Redibuja tabla, resumen, tarjetas y la gráfica con todas las posiciones."""
+        p = self.paleta
+        pos = self.sim_posiciones
+
+        self.tree_sim.delete(*self.tree_sim.get_children())
+        tot_inv = tot_val = 0.0
+        for i, s in enumerate(pos):
+            h = s["h"]
+            cantidad = s["cantidad"]
+            monto_inicial = cantidad * h.precio_base_cop
+            final = cantidad * h.precio_actual_cop
+            rend = (final / monto_inicial - 1) * 100
+            dias = (h.fecha_actual - h.fecha_base).days
+            ea = pct(rentabilidad_ea(rend, dias)) if dias >= 30 and rend > -100 else "—"
+            tot_inv += monto_inicial
+            tot_val += final
+            tag = "ganancia" if final > monto_inicial else "perdida" if final < monto_inicial else None
+            self._fila(
+                self.tree_sim,
+                (nombre_accion(s["simbolo"]), cantidad_txt(cantidad), f"{h.fecha_solicitada:%d/%m/%Y}", moneda(monto_inicial), moneda(final), pct(rend), ea),
+                i, iid=str(i), tag=tag,
+            )
+        if len(pos) > 1:
+            rend_t = (tot_val / tot_inv - 1) * 100
+            self._fila(
+                self.tree_sim,
+                ("TOTAL", "", "", moneda(tot_inv), moneda(tot_val), pct(rend_t), "—"),
+                0, iid="total", tag="total",
+            )
+
+        if pos:
+            gan = tot_val - tot_inv
+            self.lbl_sim.config(
+                foreground=p["VERDE_EXITO"] if gan >= 0 else p["ROJO_ALERTA"],
+                text=f"Invertido: {moneda(tot_inv)} | Valor hoy: {moneda(tot_val)} | "
+                     f"Resultado: {moneda(gan)} ({pct((tot_val / tot_inv - 1) * 100)})",
+            )
+            notas = []
+            for s in pos:
+                h = s["h"]
+                if h.fecha_base.date() != h.fecha_solicitada:
+                    notas.append(
+                        f"{s['simbolo']}: el {h.fecha_solicitada:%d/%m/%Y} el mercado estaba cerrado; "
+                        f"se usó el cierre del {h.fecha_base:%d/%m/%Y}."
+                    )
+                if h.es_aproximado:
+                    notas.append(f"{s['simbolo']}: serie de dólar aproximada.")
+            if len(pos) > 1:
+                notas.append("La línea Total suma cada posición desde su fecha de compra.")
+            notas.append("Dólar: COP=X de Yahoo (aproxima la TRM). Sin dividendos ni comisiones.")
+            self.lbl_sim_nota.config(text="  ".join(notas))
+        else:
+            self.lbl_sim.config(
+                foreground=p["TEXTO_PRINCIPAL"],
+                text="Elija empresa, fecha y cantidad de acciones, y pulse «Agregar a la gráfica». Puede agregar varias.",
+            )
+            self.lbl_sim_nota.config(text="")
+
+        if self._sim_sel is not None and not (0 <= self._sim_sel < len(pos)):
+            self._sim_sel = len(pos) - 1 if pos else None
+        if self._sim_sel is not None:
+            self.tree_sim.selection_set(str(self._sim_sel))
+        self._mostrar_tarjetas_sim()
+        self._dibujar_simulacion()
+
+    def _dibujar_simulacion(self):
+        """Una sola gráfica: una línea por acción agregada basada en la cantidad."""
+        p = self.paleta
+        pos = self.sim_posiciones
+        self.fig_sim.clear()
+        ax = self.fig_sim.add_subplot(111)
+        ax.set_facecolor(p["BG_CARD"])
+
+        if not pos:
+            ax.text(0.5, 0.5, "Aún no hay acciones en la simulación.", ha="center", va="center",
+                    fontsize=11, color=p["TEXTO_MUTED"])
+            ax.axis("off")
+            self.canvas_sim.draw()
+            return
+
+        colores = [p[k] for k in ("ACCESO_AZUL", "MORADO_CDT", "NARANJA_WARN", "ROJO_ALERTA", "TEAL_TES", "VERDE_EXITO")]
+        series = []
+        for i, s in enumerate(pos):
+            h = s["h"]
+            cantidad = s["cantidad"]
+            xs = [mdates.date2num(f) for f, _ in h.serie_cop]
+            vals = [cantidad * v for _, v in h.serie_cop]
+            color = colores[i % len(colores)]
+            nombre = f"{s['simbolo']} ({cantidad_txt(cantidad)} un.) · {h.fecha_solicitada:%d/%m/%Y}"
+            ax.plot(xs, vals, color=color, linewidth=2.2, label=nombre)
+            ax.scatter([xs[0]], [vals[0]], color=color, s=30, zorder=6)
+            es_cop = h.moneda_original == "COP"
+            extra = [
+                f"Acción: {self._precio_orig_txt(po, h.moneda_original)}" + ("" if es_cop else f"\nDólar: {moneda(fx)}")
+                for (_, po), (_, fx) in zip(h.serie_original, h.serie_fx)
+            ]
+            series.append({"nombre": nombre, "xs": xs, "vals": vals, "extra": extra, "color": color})
+
+        if len(pos) > 1:
+            grilla = sorted({x for sr in series for x in sr["xs"]})
+            total = []
+            for x in grilla:
+                t = 0.0
+                for sr in series:
+                    j = bisect_right(sr["xs"], x) - 1
+                    if j >= 0:
+                        t += sr["vals"][j]
+                total.append(t)
+            ax.plot(grilla, total, color=p["TEXTO_PRINCIPAL"], linewidth=1.8, linestyle="--", label="Total")
+            series.append({"nombre": "Total", "xs": grilla, "vals": total,
+                           "extra": [""] * len(grilla), "color": p["TEXTO_PRINCIPAL"]})
+
+        ax.set_title("Evolución de las inversiones simuladas (COP)", color=p["TEXTO_PRINCIPAL"],
+                     fontweight="bold", fontsize=11)
+        eje_cop(ax)
+        ax.grid(alpha=0.15, color=p["TEXTO_MUTED"], linestyle="--")
+        ax.tick_params(colors=p["TEXTO_MUTED"], labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color(p["BORDE_SUTIL"])
+        ax.legend(loc="upper left", fontsize=8, ncol=1 if len(series) <= 4 else 2,
+                  facecolor=p["BG_CARD"], edgecolor=p["BORDE_SUTIL"], labelcolor=p["TEXTO_PRINCIPAL"])
+        ax.xaxis_date()
+        self.fig_sim.autofmt_xdate()
+        self.fig_sim.subplots_adjust(left=0.1, right=0.97, top=0.92, bottom=0.2)
+        self._agregar_hover_multi(self.canvas_sim, ax, series)
+        self.canvas_sim.draw()
+
+    def _agregar_hover_multi(self, canvas, ax, series):
+        """Tooltip para varias líneas: muestra la más cercana al cursor."""
+        p = self.paleta
+        if not hasattr(self, "_hover_cids"):
+            self._hover_cids = {}
+        previo = self._hover_cids.pop(id(canvas), None)
+        if previo is not None:
+            canvas.mpl_disconnect(previo)
+
+        annot = ax.annotate(
+            "", xy=(0, 0), xytext=(14, 14), textcoords="offset points",
+            bbox=dict(boxstyle="round,pad=0.4", fc=p["BG_CARD"], ec=p["ACCESO_AZUL"], lw=1),
+            arrowprops=dict(arrowstyle="->", color=p["ACCESO_AZUL"]),
+            fontsize=9, color=p["TEXTO_PRINCIPAL"], zorder=10,
+        )
+        annot.set_visible(False)
+        punto, = ax.plot([], [], "o", markersize=7, markeredgecolor=p["BG_CARD"], zorder=9)
+        punto.set_visible(False)
+
+        def ocultar():
+            if annot.get_visible():
+                annot.set_visible(False)
+                punto.set_visible(False)
+                canvas.draw_idle()
+
+        def on_move(event):
+            if event.inaxes != ax or event.xdata is None or event.ydata is None:
+                return ocultar()
+            ymin, ymax = ax.get_ylim()
+            rango = (ymax - ymin) or 1.0
+            mejor = None
+            for sr in series:
+                xs = sr["xs"]
+                if event.xdata < xs[0] - 1 or event.xdata > xs[-1] + 1:
+                    continue
+                k = bisect_left(xs, event.xdata)
+                j = min((c for c in (k - 1, k) if 0 <= c < len(xs)), key=lambda c: abs(xs[c] - event.xdata))
+                dy = abs(sr["vals"][j] - event.ydata) / rango
+                if mejor is None or dy < mejor[0]:
+                    mejor = (dy, sr, j)
+            if mejor is None:
+                return ocultar()
+            _, sr, j = mejor
+            x, y = sr["xs"][j], sr["vals"][j]
+            texto = f"{sr['nombre']}\n{mdates.num2date(x):%d/%m/%Y}\n$ {num(y, 0)} COP"
+            if sr["extra"][j]:
+                texto += f"\n{sr['extra'][j]}"
+            annot.xy = (x, y)
+            annot.set_text(texto)
+            annot.set_visible(True)
+            punto.set_data([x], [y])
+            punto.set_color(sr["color"])
+            punto.set_visible(True)
+            canvas.draw_idle()
+
+        self._hover_cids[id(canvas)] = canvas.mpl_connect("motion_notify_event", on_move)
 
     # 11. Movimientos
 

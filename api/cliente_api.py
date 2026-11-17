@@ -8,7 +8,7 @@ import logging
 import time
 from bisect import bisect_right
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 import requests
@@ -31,6 +31,31 @@ class Cotizacion:
     dividendos: list[tuple[datetime, float]] = field(default_factory=list)
     # True cuando la serie en COP se armó con una sola tasa spot (no histórica).
     es_aproximado: bool = False
+
+
+@dataclass
+class HistoricoDesde:
+    """Resultado de consultar una acción desde una fecha elegida hasta hoy."""
+    simbolo: str
+    moneda_original: str
+    bolsa: str
+    fecha_solicitada: date
+    # Día de mercado cuyo cierre se usó (último cierre <= fecha solicitada).
+    fecha_base: datetime
+    precio_base_original: float
+    fx_base: float          # COP por 1 unidad de moneda original ese día
+    precio_base_cop: float
+    fecha_actual: datetime  # Último cierre disponible
+    precio_actual_original: float
+    fx_actual: float
+    precio_actual_cop: float
+    serie_original: list[tuple[datetime, float]] = field(default_factory=list)
+    serie_fx: list[tuple[datetime, float]] = field(default_factory=list)
+    serie_cop: list[tuple[datetime, float]] = field(default_factory=list)
+    es_aproximado: bool = False
+    # Dividendos pagados después de la compra: (fecha ex-dividendo, valor por acción).
+    dividendos: list[tuple[datetime, float]] = field(default_factory=list)       # moneda original
+    dividendos_cop: list[tuple[datetime, float]] = field(default_factory=list)   # COP al dólar de ese día
 
 
 # Cliente de mercado
@@ -258,6 +283,161 @@ class ClienteAPI:
         )
         self._cache_cotizaciones[clave] = (resultado, time.time())
         return resultado
+
+
+# Histórico desde una fecha elegida
+
+    @staticmethod
+    def _cierres(hist) -> list[tuple[datetime, float]]:
+        """Convierte un DataFrame de yfinance en lista ascendente (fecha, cierre)."""
+        out = []
+        for fecha, cierre in hist["Close"].dropna().items():
+            if getattr(fecha, "tzinfo", None) is not None:
+                fecha = fecha.tz_localize(None)
+            out.append((fecha.to_pydatetime(), float(cierre)))
+        out.sort(key=lambda x: x[0])
+        return out
+
+    def _serie_fx_desde(self, par: str, inicio: datetime) -> tuple[list[datetime], list[float]]:
+        """Serie FX ascendente desde `inicio` hasta hoy. Vacía si falla."""
+        clave = f"{par}|desde|{inicio:%Y-%m-%d}"
+        cache = self._cache_fx_hist.get(clave)
+        if cache and (time.time() - cache[2]) < self._TTL_HIST:
+            return cache[0], cache[1]
+        try:
+            fin = datetime.now() + timedelta(days=1)
+            hist = yf.Ticker(par).history(
+                start=f"{inicio:%Y-%m-%d}", end=f"{fin:%Y-%m-%d}", interval="1d"
+            )
+            if hist is None or hist.empty:
+                raise ValueError(f"Sin datos FX para {par}")
+            pares = self._cierres(hist)
+            fechas = [p[0] for p in pares]
+            valores = [p[1] for p in pares]
+            self._cache_fx_hist[clave] = (fechas, valores, time.time())
+            return fechas, valores
+        except Exception as e:  # yfinance puede lanzar varios tipos de error
+            logger.warning("FX histórico %s desde %s falló: %s", par, inicio.date(), e)
+            return [], []
+
+    def consultar_desde(self, simbolo: str, desde: date) -> HistoricoDesde:
+        """
+        Precio de la acción y valor del dólar en `desde`, más la serie hasta hoy.
+        Si `desde` fue un día sin mercado (fin de semana o festivo) se usa el
+        último cierre anterior.
+        """
+        simbolo = simbolo.upper().strip()
+        if not simbolo:
+            raise ValueError("Debe indicar una acción.")
+        if desde > date.today():
+            raise ValueError("La fecha no puede ser futura.")
+
+        # Se pide margen previo para cubrir fines de semana y festivos.
+        inicio = datetime.combine(desde, datetime.min.time()) - timedelta(days=10)
+        fin = datetime.now() + timedelta(days=1)
+
+        ticker = yf.Ticker(simbolo)
+        # auto_adjust=False: el cierre es el precio real de ese día (solo ajustado por
+        # splits). Con el ajuste por dividendos los dividendos se contarían dos veces.
+        hist = ticker.history(
+            start=f"{inicio:%Y-%m-%d}", end=f"{fin:%Y-%m-%d}", interval="1d",
+            auto_adjust=False,
+        )
+        if hist is None or hist.empty:
+            raise ValueError(f"Símbolo sin datos: {simbolo}")
+        serie = self._cierres(hist)
+        if not serie:
+            raise ValueError(f"Sin precios válidos para {simbolo}")
+
+        fechas_serie = [f for f, _ in serie]
+        limite = datetime.combine(desde, datetime.max.time())
+        i_base = bisect_right(fechas_serie, limite) - 1
+        if i_base < 0:
+            raise ValueError(
+                f"{simbolo} no tenía cotización el {desde:%d/%m/%Y}. "
+                f"Primer dato disponible: {fechas_serie[0]:%d/%m/%Y}."
+            )
+        serie = serie[i_base:]  # desde el día base hasta hoy
+        fecha_base, precio_base = serie[0]
+        fecha_actual, precio_actual = serie[-1]
+
+        moneda = "USD"
+        bolsa = "DESCONOCIDA"
+        try:
+            info = ticker.fast_info
+            moneda = str(info.get("currency") or "USD").upper()
+            bolsa = str(info.get("exchange") or "DESCONOCIDA").upper()
+        except (AttributeError, KeyError, TypeError):
+            pass
+
+        es_aproximado = False
+        if moneda == "COP":
+            serie_fx = [(f, 1.0) for f, _ in serie]
+        elif moneda == "USD":
+            fx_fechas, fx_vals = self._serie_fx_desde("COP=X", fecha_base - timedelta(days=10))
+            if fx_fechas:
+                serie_fx = []
+                for f, _ in serie:
+                    j = bisect_right(fx_fechas, f) - 1
+                    serie_fx.append((f, fx_vals[j] if j >= 0 else fx_vals[0]))
+            else:
+                trm = self.obtener_trm()
+                serie_fx = [(f, trm) for f, _ in serie]
+                es_aproximado = True
+        else:
+            tasas = self.obtener_tasas_usd()
+            cop_por_usd = tasas.get("COP")
+            usd_por_moneda = tasas.get(moneda)
+            if not cop_por_usd or not usd_por_moneda:
+                raise ValueError(f"Moneda no soportada por ER-API: {moneda}")
+            factor = cop_por_usd / usd_por_moneda
+            serie_fx = [(f, factor) for f, _ in serie]
+            es_aproximado = True
+
+        serie_cop = [(f, p * t) for (f, p), (_, t) in zip(serie, serie_fx)]
+
+        # Dividendos con fecha ex-dividendo posterior al día de compra (quien compra
+        # ese mismo día o después de la ex-fecha no los recibe).
+        dividendos: list[tuple[datetime, float]] = []
+        try:
+            divs = ticker.dividends
+            if divs is not None and not divs.empty:
+                for fecha, val in divs.items():
+                    if getattr(fecha, "tzinfo", None) is not None:
+                        fecha = fecha.tz_localize(None)
+                    f = fecha.to_pydatetime()
+                    if f > fecha_base and float(val) > 0:
+                        dividendos.append((f, float(val)))
+                dividendos.sort(key=lambda x: x[0])
+        except (AttributeError, KeyError, TypeError):
+            pass
+        # Cada dividendo se pasa a COP con la tasa vigente el día del pago.
+        fechas_fx = [f for f, _ in serie_fx]
+        dividendos_cop = []
+        for f, v in dividendos:
+            j = max(bisect_right(fechas_fx, f) - 1, 0)
+            dividendos_cop.append((f, v * serie_fx[j][1]))
+
+        return HistoricoDesde(
+            simbolo=simbolo,
+            moneda_original=moneda,
+            bolsa=bolsa,
+            fecha_solicitada=desde,
+            fecha_base=fecha_base,
+            precio_base_original=precio_base,
+            fx_base=serie_fx[0][1],
+            precio_base_cop=serie_cop[0][1],
+            fecha_actual=fecha_actual,
+            precio_actual_original=precio_actual,
+            fx_actual=serie_fx[-1][1],
+            precio_actual_cop=serie_cop[-1][1],
+            serie_original=serie,
+            serie_fx=serie_fx,
+            serie_cop=serie_cop,
+            es_aproximado=es_aproximado,
+            dividendos=dividendos,
+            dividendos_cop=dividendos_cop,
+        )
 
 
 # Conversión entre divisas
